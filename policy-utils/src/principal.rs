@@ -13,6 +13,7 @@
 //! information on licensing and copyright.
 
 use super::error::PolicyError;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, string::String, vec::Vec};
 use wasi_types::Rights;
@@ -149,7 +150,7 @@ pub enum ExecutionStrategy {
 /// certificates: in some contexts these should be unparsed text representations
 /// of the certificates (e.g. in the material below), and in other circumstances
 /// a parsed format is more appropriate, e.g. the `Certificate` type from the
-/// `RusTLS` library, as used by the session manager.  We therefore abstract
+/// `Mbed TLS` library, as used by the session manager.  We therefore abstract
 /// over the concrete types of certificates to obtain a single type that suits
 /// both contexts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -213,11 +214,9 @@ impl Identity<String> {
     /// NOTE: the X509 apparently does not check the end of certificates for a
     /// valid certificate termination line.  As a result, we check that in this
     /// function.
-    pub fn assert_valid(&self) -> Result<(), PolicyError> {
+    pub fn assert_valid(&self) -> Result<()> {
         if !self.certificate().ends_with("-----END CERTIFICATE-----") {
-            return Err(PolicyError::CertificateFormatError(
-                self.certificate().clone(),
-            ));
+            return Err(anyhow!(PolicyError::FormatError));
         }
 
         #[cfg(features = "std")]
@@ -228,9 +227,7 @@ impl Identity<String> {
             let parsed_cert = parsed_cert.0.parse_x509()?.tbs_certificate;
 
             if parsed_cert.validity.time_to_expiration().is_none() {
-                return Err(PolicyError::CertificateExpireError(
-                    self.certificate().clone(),
-                ));
+                return Err(anyhow!(PolicyError::FormatError));
             }
         }
 

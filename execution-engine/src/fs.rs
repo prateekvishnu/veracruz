@@ -16,7 +16,9 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::native_modules::{aes::AesCounterModeService, postcard::PostcardService};
+use crate::native_modules::{
+    aead::AeadService, aes::AesCounterModeService, common::Service, postcard::PostcardService,
+};
 use policy_utils::{
     principal::{FileRights, Principal, RightsTable},
     CANONICAL_STDERR_FILE_PATH, CANONICAL_STDIN_FILE_PATH, CANONICAL_STDOUT_FILE_PATH,
@@ -808,6 +810,8 @@ impl FileSystem {
         ));
         let service: Box<dyn Service> = Box::new(AesCounterModeService::new());
         services.push(("/services/aesctr.dat", Arc::new(Mutex::new(service))));
+        let service: Box<dyn Service> = Box::new(AeadService::new());
+        services.push(("/services/aead.dat", Arc::new(Mutex::new(service))));
         rst.install_services(services)?;
         Ok(rst)
     }
@@ -1950,20 +1954,4 @@ where
 
 fn strip_root_slash(path: &Path) -> &Path {
     path.strip_prefix("/").unwrap_or(path)
-}
-
-pub trait Service: Send {
-    fn name(&self) -> &str;
-    //fn configure(&mut self, config: Self::Configuration) -> FileSystemResult<()>;
-    // The FS will prepare the Input and call the serve function at an appropriate time.
-    // Result may depend on the configure.
-    fn serve(&mut self, fs: &mut FileSystem, input: &[u8]) -> FileSystemResult<()>;
-    // try_parse may buffer any result, hence we pass a mutable self here.
-    fn try_parse(&mut self, input: &[u8]) -> FileSystemResult<bool>;
-}
-
-impl Debug for dyn Service {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Service: {}", self.name())
-    }
 }

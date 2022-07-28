@@ -27,6 +27,7 @@ use std::{env, fs::File, io::prelude::*, io::Read, path::PathBuf, sync::Arc};
 use actix_session::Session;
 use actix_web::http::StatusCode;
 use actix_web::{post, HttpRequest, HttpResponse};
+use mbedtls::x509::Certificate;
 
 pub fn trust_path(filename: &str) -> PathBuf {
     PathBuf::from(env::var("VERACRUZ_TRUST_DIR").unwrap_or("../test-collateral".to_string()))
@@ -44,7 +45,7 @@ fn test_internal_read_all_bytes_in_file_succ() {
     if let Err(_) = File::create(filename).and_then(|mut file| file.write_all(content)) {
         panic!("cannot create test file: {}", filename);
     }
-    let rst = VeracruzClient::pub_read_all_bytes_in_file(filename);
+    let rst = VeracruzClient::read_all_bytes_in_file(filename);
     assert!(rst.is_ok());
     let rst_content = rst.unwrap();
     assert_eq!(rst_content, content);
@@ -52,32 +53,32 @@ fn test_internal_read_all_bytes_in_file_succ() {
 
 #[test]
 fn test_internal_read_all_bytes_in_file_invalid_file() {
-    assert!(VeracruzClient::pub_read_all_bytes_in_file(data_dir("invalid_file")).is_err());
+    assert!(VeracruzClient::read_all_bytes_in_file(data_dir("invalid_file")).is_err());
 }
 
 #[test]
 fn test_internal_read_all_bytes_in_file_invalid_path() {
-    assert!(VeracruzClient::pub_read_all_bytes_in_file("invalid_path").is_err());
+    assert!(VeracruzClient::read_all_bytes_in_file("invalid_path").is_err());
 }
 
 #[test]
 fn test_internal_read_cert_succ() {
-    assert!(VeracruzClient::pub_read_cert(trust_path(CLIENT_CERT_FILENAME)).is_ok());
+    assert!(VeracruzClient::read_cert(trust_path(CLIENT_CERT_FILENAME)).is_ok());
 }
 
 #[test]
 fn test_internal_read_cert_invalid_certificate() {
-    assert!(VeracruzClient::pub_read_cert(trust_path(CLIENT_KEY_FILENAME)).is_err());
+    assert!(VeracruzClient::read_cert(trust_path(CLIENT_KEY_FILENAME)).is_err());
 }
 
 #[test]
 fn test_internal_read_private_key_succ() {
-    assert!(VeracruzClient::pub_read_private_key(trust_path(CLIENT_KEY_FILENAME)).is_ok());
+    assert!(VeracruzClient::read_private_key(trust_path(CLIENT_KEY_FILENAME)).is_ok());
 }
 
 #[test]
 fn test_internal_read_cert_invalid_private_key() {
-    assert!(VeracruzClient::pub_read_private_key(trust_path(CLIENT_CERT_FILENAME)).is_err());
+    assert!(VeracruzClient::read_private_key(trust_path(CLIENT_CERT_FILENAME)).is_err());
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn veracruz_client_session() {
         let mut cert_buffer = std::vec::Vec::new();
         cert_file.read_to_end(&mut cert_buffer).unwrap();
         cert_buffer.push(b'\0');
-        let certs = mbedtls::x509::Certificate::from_pem_multiple(&cert_buffer).unwrap();
+        let certs = Certificate::from_pem_multiple(&cert_buffer).unwrap();
         assert!(certs.iter().count() == 1);
         certs
     };
@@ -103,8 +104,13 @@ fn veracruz_client_session() {
         let mut key_buffer = std::vec::Vec::new();
         key_file.read_to_end(&mut key_buffer).unwrap();
         key_buffer.push(b'\0');
-        let rsa_keys = mbedtls::pk::Pk::from_private_key(&key_buffer, None)
-            .expect("file contains invalid rsa private key");
+        let rsa_keys = mbedtls::pk::Pk::from_private_key(
+            &mut mbedtls::rng::CtrDrbg::new(Arc::new(mbedtls::rng::OsEntropy::new()), None)
+                .unwrap(),
+            &key_buffer,
+            None,
+        )
+        .expect("file contains invalid rsa private key");
         rsa_keys
     };
 
@@ -123,7 +129,7 @@ fn veracruz_client_session() {
         let mut cert_buffer = std::vec::Vec::new();
         cert_file.read_to_end(&mut cert_buffer).unwrap();
         cert_buffer.push(b'\0');
-        let certs = mbedtls::x509::Certificate::from_pem_multiple(&cert_buffer).unwrap();
+        let certs = Certificate::from_pem_multiple(&cert_buffer).unwrap();
         assert!(certs.iter().count() == 1);
         certs
     };
@@ -135,10 +141,10 @@ fn veracruz_client_session() {
     );
     config.set_ca_list(Arc::new(client_cert), None);
     config
-        .set_min_version(mbedtls::ssl::config::Version::Tls1_2)
+        .set_min_version(mbedtls::ssl::config::Version::Tls1_3)
         .unwrap();
     config
-        .set_max_version(mbedtls::ssl::config::Version::Tls1_2)
+        .set_max_version(mbedtls::ssl::config::Version::Tls1_3)
         .unwrap();
     config
         .push_cert(Arc::new(server_cert), Arc::new(server_priv_key))

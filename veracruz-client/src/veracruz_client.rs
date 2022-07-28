@@ -10,17 +10,20 @@
 //! information on licensing and copyright.
 
 use crate::error::VeracruzClientError;
+use anyhow::{anyhow, Result};
 use log::{error, info};
-use mbedtls::alloc::List;
+use mbedtls::{alloc::List, pk::Pk, ssl::Context, x509::Certificate};
 use policy_utils::{parsers::enforce_leading_backslash, policy::Policy, Platform};
 use std::{
-    convert::TryFrom,
-    io::{Read, Write},
+    fs::File,
+    io::{BufReader, Read, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 use veracruz_utils::VERACRUZ_RUNTIME_HASH_EXTENSION_ID;
-use webpki;
 
 /// VeracruzClient struct. The remote_session_id is shared between
 /// VeracruzClient and InsecureConnection so that it is available from
@@ -29,8 +32,9 @@ use webpki;
 /// expect multiple threads to be involved, since the compiler can not
 /// check this, it is safer to use a Mutex.
 pub struct VeracruzClient {
-    tls_context: mbedtls::ssl::Context<InsecureConnection>,
-    remote_session_id: Arc<Mutex<Option<u32>>>,
+    tls_context: Context<InsecureConnection>,
+    // The default should be ZERO
+    remote_session_id: Arc<AtomicU32>,
     policy: Policy,
     policy_hash: String,
 }
@@ -40,16 +44,24 @@ pub struct VeracruzClient {
 struct InsecureConnection {
     read_buffer: Vec<u8>,
     veracruz_server_url: String,
-    remote_session_id: Arc<Mutex<Option<u32>>>,
+    // The default should be ZERO
+    remote_session_id: Arc<AtomicU32>,
 }
 
 impl Read for InsecureConnection {
     fn read(&mut self, data: &mut [u8]) -> Result<usize, std::io::Error> {
         // Return as much data from the read_buffer as fits.
         let n = std::cmp::min(data.len(), self.read_buffer.len());
-        data[0..n].clone_from_slice(&self.read_buffer[0..n]);
-        self.read_buffer = self.read_buffer[n..].to_vec();
-        Ok(n)
+        if n == 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "InsecureConnection Read",
+            ))
+        } else {
+            data[0..n].clone_from_slice(&self.read_buffer[0..n]);
+            self.read_buffer = self.read_buffer[n..].to_vec();
+            Ok(n)
+        }
     }
 }
 
@@ -62,13 +74,10 @@ impl Write for InsecureConnection {
         let string_data = base64::encode(&data);
         let combined_string = format!(
             "{:} {:}",
-            self.remote_session_id
-                .lock()
-                .map_err(|_| err("lock failed"))?
-                .unwrap_or(0),
+            self.remote_session_id.load(Ordering::SeqCst),
             string_data
         );
-        let dest_url = format!("http://{:}/runtime_manager", self.veracruz_server_url,);
+        let dest_url = format!("http://{:}/runtime_manager", self.veracruz_server_url);
         // Spawn a separate thread so that we can use reqwest::blocking.
         let body = std::thread::spawn(move || {
             let client_build = reqwest::blocking::ClientBuilder::new()
@@ -93,10 +102,8 @@ impl Write for InsecureConnection {
             let received_session_id = body_items[0]
                 .parse::<u32>()
                 .map_err(|_| err("bad session id"))?;
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| err("lock failed"))? = Some(received_session_id);
+            self.remote_session_id
+                .store(received_session_id, Ordering::SeqCst);
             // And append response data to the read_buffer.
             for item in body_items.iter().skip(1) {
                 let this_body_data = base64::decode(item).map_err(|_| err("base64::decode"))?;
@@ -116,13 +123,13 @@ impl VeracruzClient {
     /// Read all the bytes in the file.
     /// Return Ok(vec) if succ
     /// Otherwise return Err(msg) with the error message as String
-    fn read_all_bytes_in_file<P: AsRef<Path>>(filename: P) -> Result<Vec<u8>, VeracruzClientError> {
+    pub(crate) fn read_all_bytes_in_file<P: AsRef<Path>>(filename: P) -> Result<Vec<u8>> {
         let mut file = std::fs::File::open(filename)?;
         let mut buffer = std::vec::Vec::new();
         match file.read_to_end(&mut buffer) {
             Ok(_num) => (),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
-            Err(err) => return Err(VeracruzClientError::IOError(err)),
+            Err(err) => return Err(err.into()),
         }
 
         Ok(buffer)
@@ -132,18 +139,14 @@ impl VeracruzClient {
     /// Read the certificate in the file.
     /// Return Ok(vec) if succ
     /// Otherwise return Err(msg) with the error message as String
-    // TODO: use generic functions to unify read_cert and read_private_key
-    fn read_cert<P: AsRef<Path>>(
-        filename: P,
-    ) -> Result<List<mbedtls::x509::Certificate>, VeracruzClientError> {
+    pub(crate) fn read_cert<P: AsRef<Path>>(filename: P) -> Result<List<Certificate>> {
         let mut buffer = VeracruzClient::read_all_bytes_in_file(filename)?;
         buffer.push(b'\0');
-        let cert_vec = mbedtls::x509::Certificate::from_pem_multiple(&buffer)
-            .map_err(|_| VeracruzClientError::TLSUnspecifiedError)?;
+        let cert_vec = Certificate::from_pem_multiple(&buffer)?;
         if cert_vec.iter().count() == 1 {
             Ok(cert_vec)
         } else {
-            Err(VeracruzClientError::InvalidLengthError("cert_vec", 1))
+            Err(anyhow!(VeracruzClientError::UnexpectedCertificate))
         }
     }
 
@@ -151,13 +154,14 @@ impl VeracruzClient {
     /// Read the private in the file.
     /// Return Ok(vec) if succ
     /// Otherwise return Err(msg) with the error message as String
-    fn read_private_key<P: AsRef<Path>>(
-        filename: P,
-    ) -> Result<mbedtls::pk::Pk, VeracruzClientError> {
+    pub(crate) fn read_private_key<P: AsRef<Path>>(filename: P) -> Result<Pk> {
         let mut buffer = VeracruzClient::read_all_bytes_in_file(filename)?;
         buffer.push(b'\0');
-        let pkey_vec = mbedtls::pk::Pk::from_private_key(&buffer, None)
-            .map_err(|_| VeracruzClientError::TLSUnspecifiedError)?;
+        let pkey_vec = Pk::from_private_key(
+            &mut mbedtls::rng::CtrDrbg::new(Arc::new(mbedtls::rng::OsEntropy::new()), None)?,
+            &buffer,
+            None,
+        )?;
         Ok(pkey_vec)
     }
 
@@ -166,30 +170,20 @@ impl VeracruzClient {
     /// check if the certificate is valid in term of time.
     fn check_certificate_validity<P: AsRef<Path>>(
         client_cert_filename: P,
-        public_key: &mut mbedtls::pk::Pk,
-    ) -> Result<(), VeracruzClientError> {
-        let cert_file = std::fs::File::open(&client_cert_filename)?;
-        let parsed_cert = x509_parser::pem::Pem::read(std::io::BufReader::new(cert_file))?;
-        let parsed_cert = parsed_cert
-            .0
-            .parse_x509()
-            .map_err(|e| VeracruzClientError::X509ParserError(e.to_string()))?
-            .tbs_certificate;
+        public_key: &mut Pk,
+    ) -> Result<()> {
+        let cert_file = File::open(&client_cert_filename)?;
+        let parsed_cert = x509_parser::pem::Pem::read(BufReader::new(cert_file))?;
+        let parsed_cert = parsed_cert.0.parse_x509()?.tbs_certificate;
         let cert_public_key_der =
-            mbedtls::pk::Pk::from_public_key(parsed_cert.subject_pki.subject_public_key.data)?
+            Pk::from_public_key(parsed_cert.subject_pki.subject_public_key.data)?
                 .write_public_der_vec()?;
 
         let public_key_der = public_key.write_public_der_vec()?;
         if cert_public_key_der != public_key_der {
-            Err(VeracruzClientError::MismatchError {
-                variable: "public_key",
-                expected: cert_public_key_der,
-                received: public_key_der,
-            })
+            Err(anyhow!(VeracruzClientError::UnexpectedKey))
         } else if parsed_cert.validity.time_to_expiration().is_none() {
-            Err(VeracruzClientError::CertificateExpireError(
-                client_cert_filename.as_ref().to_string_lossy().to_string(),
-            ))
+            Err(anyhow!(VeracruzClientError::UnexpectedCertificate))
         } else {
             Ok(())
         }
@@ -202,11 +196,11 @@ impl VeracruzClient {
         client_cert_filename: P1,
         client_key_filename: P2,
         policy_json: &str,
-    ) -> Result<VeracruzClient, VeracruzClientError> {
+    ) -> Result<VeracruzClient> {
         let policy = Policy::from_json(policy_json)?;
         let policy_hash = policy
             .policy_hash()
-            .expect("policy did not hash json?")
+            .ok_or(anyhow!(VeracruzClientError::UnexpectedPolicy))?
             .to_string();
 
         Self::with_policy_and_hash(
@@ -226,7 +220,7 @@ impl VeracruzClient {
         client_key_filename: P2,
         policy: Policy,
         policy_hash: String,
-    ) -> Result<VeracruzClient, VeracruzClientError> {
+    ) -> Result<VeracruzClient> {
         let client_cert = Self::read_cert(&client_cert_filename)?;
         let mut client_priv_key = Self::read_private_key(&client_key_filename)?;
 
@@ -236,27 +230,16 @@ impl VeracruzClient {
         let proxy_service_cert = {
             let mut certs_pem = policy.proxy_service_cert().clone();
             certs_pem.push('\0');
-            let certs = mbedtls::x509::Certificate::from_pem_multiple(certs_pem.as_bytes())
-                .map_err(|_| {
-                    VeracruzClientError::X509ParserError(
-                        "mbedtls::x509::Certificate::from_pem_multiple".to_string(),
-                    )
-                })?;
+            let certs = Certificate::from_pem_multiple(certs_pem.as_bytes())?;
             certs
         };
-        let mut config = mbedtls::ssl::Config::new(
-            mbedtls::ssl::config::Endpoint::Client,
-            mbedtls::ssl::config::Transport::Stream,
-            mbedtls::ssl::config::Preset::Default,
-        );
-        config.set_min_version(mbedtls::ssl::config::Version::Tls1_2)?;
-        config.set_max_version(mbedtls::ssl::config::Version::Tls1_2)?;
-        let policy_ciphersuite = veracruz_utils::lookup_ciphersuite_mbedtls(
-            policy.ciphersuite().as_str(),
-        )
-        .ok_or_else(|| {
-            VeracruzClientError::TLSInvalidCiphersuiteError(policy.ciphersuite().to_string())
-        })?;
+
+        use mbedtls::ssl::config::{Config, Endpoint, Preset, Transport, Version};
+        let mut config = Config::new(Endpoint::Client, Transport::Stream, Preset::Default);
+        config.set_min_version(Version::Tls1_3)?;
+        config.set_max_version(Version::Tls1_3)?;
+        let policy_ciphersuite = veracruz_utils::lookup_ciphersuite(policy.ciphersuite().as_str())
+            .ok_or(anyhow!(VeracruzClientError::UnexpectedCiphersuite))?;
         let cipher_suites: Vec<i32> = vec![policy_ciphersuite.into(), 0];
         config.set_ciphersuites(Arc::new(cipher_suites));
         let entropy = Arc::new(mbedtls::rng::OsEntropy::new());
@@ -264,196 +247,111 @@ impl VeracruzClient {
         config.set_rng(rng);
         config.set_ca_list(Arc::new(proxy_service_cert), None);
         config.push_cert(Arc::new(client_cert), Arc::new(client_priv_key))?;
-        let mut ctx = mbedtls::ssl::Context::new(Arc::new(config));
-        let remote_session_id = Arc::new(Mutex::new(Some(0)));
+        let mut ctx = Context::new(Arc::new(config));
+        let remote_session_id = Arc::new(AtomicU32::new(0));
         let conn = InsecureConnection {
             read_buffer: vec![],
             veracruz_server_url: policy.veracruz_server_url().to_string(),
-            remote_session_id: Arc::clone(&remote_session_id),
+            remote_session_id: remote_session_id.clone(),
         };
         ctx.establish(conn, None)?;
 
         Ok(VeracruzClient {
             tls_context: ctx,
-            remote_session_id: Arc::clone(&remote_session_id),
+            remote_session_id: remote_session_id.clone(),
             policy,
             policy_hash,
         })
     }
 
-    /// Check the policy and runtime hashes, and then send the `program` to the remote `path`.
-    pub async fn send_program<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-        program: &[u8],
-    ) -> Result<(), VeracruzClientError> {
-        self.check_policy_hash().await?;
-        self.check_runtime_hash()?;
-
-        let path = enforce_leading_backslash(
-            path.as_ref()
-                .to_str()
-                .ok_or(VeracruzClientError::InvalidPath)?,
-        );
-        let serialized_program = transport_protocol::serialize_program(program, &path)?;
-        let response = self.send(&serialized_program).await?;
-        let parsed_response = transport_protocol::parse_runtime_manager_response(
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| VeracruzClientError::LockFailed)?,
-            &response,
-        )?;
-        let status = parsed_response.get_status();
-        match status {
-            transport_protocol::ResponseStatus::SUCCESS => Ok(()),
-            _ => Err(VeracruzClientError::ResponseError("send_program", status)),
-        }
-    }
-
-    /// Check the policy and runtime hashes, and then send the `data` to the remote `path`.
-    pub async fn send_data<P: AsRef<Path>>(
+    /// A general pattern of the request, which lift the `serialize_functor` to a request to
+    /// veracruz and parse the response.
+    pub fn request_functor<P: AsRef<Path>>(
         &mut self,
         path: P,
         data: &[u8],
-    ) -> Result<(), VeracruzClientError> {
-        self.check_policy_hash().await?;
-        self.check_runtime_hash()?;
-
+        serialize_functor: fn(&[u8], &str) -> transport_protocol::TransportProtocolResult,
+    ) -> Result<transport_protocol::RuntimeManagerResponse> {
         let path = enforce_leading_backslash(
             path.as_ref()
                 .to_str()
                 .ok_or(VeracruzClientError::InvalidPath)?,
         );
-        let serialized_data = transport_protocol::serialize_program_data(data, &path)?;
-        let response = self.send(&serialized_data).await?;
+        let serialized_data = serialize_functor(data, &path)?;
+        let response = self.send(&serialized_data)?;
 
         let parsed_response = transport_protocol::parse_runtime_manager_response(
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| VeracruzClientError::LockFailed)?,
+            Some(self.remote_session_id.load(Ordering::SeqCst)),
             &response,
         )?;
         let status = parsed_response.get_status();
         match status {
-            transport_protocol::ResponseStatus::SUCCESS => Ok(()),
-            _ => Err(VeracruzClientError::ResponseError("send_data", status)),
+            transport_protocol::ResponseStatus::SUCCESS => Ok(parsed_response),
+            _ => Err(anyhow!(VeracruzClientError::ResponseStatus(status))),
         }
+    }
+
+    /// Request to write `data` to the `path` from the beginning.
+    pub fn write_file<P: AsRef<Path>>(&mut self, path: P, data: &[u8]) -> Result<()> {
+        self.request_functor(path, data, transport_protocol::serialize_write_file)?;
+        Ok(())
+    }
+
+    /// Request to append `data` to the `path`.
+    pub fn append_file<P: AsRef<Path>>(&mut self, path: P, data: &[u8]) -> Result<()> {
+        self.request_functor(path, data, transport_protocol::serialize_append_file)?;
+        Ok(())
     }
 
     /// Check the policy and runtime hashes, and request the veracruz to execute the program at the
     /// remote `path`.
-    pub async fn request_compute<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-    ) -> Result<Vec<u8>, VeracruzClientError> {
-        self.check_policy_hash().await?;
-        self.check_runtime_hash()?;
+    pub fn request_compute<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
+        let parsed_response = self.request_functor(path, &[], |_, path| {
+            transport_protocol::serialize_request_result(path)
+        })?;
 
-        let path = enforce_leading_backslash(
-            path.as_ref()
-                .to_str()
-                .ok_or(VeracruzClientError::InvalidPath)?,
-        );
-        let serialized_read_result = transport_protocol::serialize_request_result(&path)?;
-        let response = self.send(&serialized_read_result).await?;
-
-        let parsed_response = transport_protocol::parse_runtime_manager_response(
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| VeracruzClientError::LockFailed)?,
-            &response,
-        )?;
-        let status = parsed_response.get_status();
-        if status != transport_protocol::ResponseStatus::SUCCESS {
-            return Err(VeracruzClientError::ResponseError(
-                "request_compute",
-                status,
-            ));
-        }
         if !parsed_response.has_result() {
-            return Err(VeracruzClientError::VeracruzServerResponseNoResultError);
+            return Err(anyhow!(VeracruzClientError::ResponseNoResult));
         }
-        let response_data = &parsed_response.get_result().data;
-        Ok(response_data.clone())
+        Ok(parsed_response.get_result().data.clone())
     }
 
     /// Check the policy and runtime hashes, and read the result at the remote `path`.
-    pub async fn get_results<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-    ) -> Result<Vec<u8>, VeracruzClientError> {
-        self.check_policy_hash().await?;
-        self.check_runtime_hash()?;
+    pub fn read_file<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
+        let parsed_response = self.request_functor(path, &[], |_, path| {
+            transport_protocol::serialize_read_file(path)
+        })?;
 
-        let path = enforce_leading_backslash(
-            path.as_ref()
-                .to_str()
-                .ok_or(VeracruzClientError::InvalidPath)?,
-        );
-        let serialized_read_result = transport_protocol::serialize_read_file(&path)?;
-        let response = self.send(&serialized_read_result).await?;
-
-        let parsed_response = transport_protocol::parse_runtime_manager_response(
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| VeracruzClientError::LockFailed)?,
-            &response,
-        )?;
-        let status = parsed_response.get_status();
-        if status != transport_protocol::ResponseStatus::SUCCESS {
-            return Err(VeracruzClientError::ResponseError("get_result", status));
-        }
         if !parsed_response.has_result() {
-            return Err(VeracruzClientError::VeracruzServerResponseNoResultError);
+            return Err(anyhow!(VeracruzClientError::ResponseNoResult));
         }
-        let response_data = &parsed_response.get_result().data;
-        Ok(response_data.clone())
+        Ok(parsed_response.get_result().data.clone())
     }
 
     /// Indicate the veracruz to shutdown.
-    pub async fn request_shutdown(&mut self) -> Result<(), VeracruzClientError> {
-        let serialized_request = transport_protocol::serialize_request_shutdown()?;
-        let _response = self.send(&serialized_request).await?;
+    pub fn request_shutdown(&mut self) -> Result<()> {
+        self.request_functor("", &[], |_, _| {
+            transport_protocol::serialize_request_shutdown()
+        })?;
         Ok(())
     }
 
     /// Request the hash of the remote policy and check if it matches.
-    async fn check_policy_hash(&mut self) -> Result<(), VeracruzClientError> {
-        let serialized_rph = transport_protocol::serialize_request_policy_hash()?;
-        let response = self.send(&serialized_rph).await?;
-        let parsed_response = transport_protocol::parse_runtime_manager_response(
-            *self
-                .remote_session_id
-                .lock()
-                .map_err(|_| VeracruzClientError::LockFailed)?,
-            &response,
-        )?;
-        match parsed_response.status {
-            transport_protocol::ResponseStatus::SUCCESS => {
-                let received_hash = std::str::from_utf8(&parsed_response.get_policy_hash().data)?;
-                if self.policy_hash != received_hash {
-                    return Err(VeracruzClientError::MismatchError {
-                        variable: "check_policy_hash",
-                        expected: self.policy_hash.as_bytes().to_vec(),
-                        received: received_hash.as_bytes().to_vec(),
-                    });
-                } else {
-                    Ok(())
-                }
-            }
-            _ => Err(VeracruzClientError::ResponseError(
-                "check_policy_hash",
-                parsed_response.status,
-            )),
+    pub fn check_policy_hash(&mut self) -> Result<()> {
+        let parsed_response = self.request_functor("", &[], |_, _| {
+            transport_protocol::serialize_request_policy_hash()
+        })?;
+
+        let received_hash = std::str::from_utf8(&parsed_response.get_policy_hash().data)?;
+        if self.policy_hash != received_hash {
+            Err(anyhow!(VeracruzClientError::UnexpectedPolicy))
+        } else {
+            Ok(())
         }
     }
 
     /// Check if the hash `received` matches those in the policy.
-    fn compare_runtime_hash(&self, received: &[u8]) -> Result<(), VeracruzClientError> {
+    fn compare_runtime_hash(&self, received: &[u8]) -> Result<()> {
         let platforms = vec![Platform::Linux, Platform::Nitro, Platform::IceCap];
         for platform in platforms {
             let expected = match self.policy.runtime_manager_hash(&platform) {
@@ -466,135 +364,45 @@ impl VeracruzClient {
                 return Ok(());
             }
         }
-        Err(VeracruzClientError::NoMatchingRuntimeIsolateHash)
+        Err(anyhow!(VeracruzClientError::UnexpectedRuntimeHash))
     }
 
     /// Request the hash of the remote veracruz runtime and check if it matches.
-    fn check_runtime_hash(&self) -> Result<(), VeracruzClientError> {
-        let certs = self.tls_context.peer_cert();
+    pub fn check_runtime_hash(&self) -> Result<()> {
+        let certs = self.tls_context.peer_cert()?;
         if certs.iter().count() != 1 {
-            return Err(VeracruzClientError::NoPeerCertificatesError);
+            return Err(anyhow!(VeracruzClientError::NoPeerCertificates));
         }
         let cert = certs
+            .ok_or(anyhow!(VeracruzClientError::UnexpectedCertificate))?
             .iter()
             .nth(0)
-            .ok_or(VeracruzClientError::UnexpectedCertificateError)?
-            .ok_or(VeracruzClientError::UnexpectedCertificateError)?
-            .iter()
-            .nth(0)
-            .ok_or(VeracruzClientError::UnexpectedCertificateError)?;
-        let ee_cert = webpki::EndEntityCert::try_from(cert.as_der())?;
-        let ues = ee_cert.unrecognized_extensions();
+            .ok_or(anyhow!(VeracruzClientError::UnexpectedCertificate))?;
+        let extensions = cert.extensions()?;
         // check for OUR extension
-        // The Extension is encoded using DER, which puts the first two
-        // elements in the ID in 1 byte, and the rest get their own bytes
-        // This encoding is specified in ITU Recommendation x.690,
-        // which is available here: https://www.itu.int/rec/T-REC-X.690-202102-I/en
-        // but it's deep inside a PDF...
-        let encoded_extension_id: [u8; 3] = [
-            VERACRUZ_RUNTIME_HASH_EXTENSION_ID[0] * 40 + VERACRUZ_RUNTIME_HASH_EXTENSION_ID[1],
-            VERACRUZ_RUNTIME_HASH_EXTENSION_ID[2],
-            VERACRUZ_RUNTIME_HASH_EXTENSION_ID[3],
-        ];
-        match ues.get(&encoded_extension_id[..]) {
-            None => {
+        let data = veracruz_utils::find_extension(extensions, &VERACRUZ_RUNTIME_HASH_EXTENSION_ID)
+            .ok_or({
                 error!("Our extension is not present. This should be fatal");
-                Err(VeracruzClientError::RuntimeHashExtensionMissingError)
-            }
-            Some(data) => {
-                info!("Certificate extension present.");
-                let extension_data = data
-                    .read_all(VeracruzClientError::UnableToReadError, |input| {
-                        Ok(input.read_bytes_to_end())
-                    })?;
-                info!("Certificate extension extracted correctly.");
-                match self.compare_runtime_hash(extension_data.as_slice_less_safe()) {
-                    Ok(_) => {
-                        info!("Runtime hash matches.");
-                        Ok(())
-                    }
-                    Err(err) => {
-                        error!("Runtime hash mismatch: {}.", err);
-                        Err(err)
-                    }
-                }
-            }
-        }
+                anyhow!(VeracruzClientError::RuntimeHashExtensionMissing)
+            })?;
+        info!("Certificate extension present.");
+        self.compare_runtime_hash(&data).map_err(|err| {
+            error!("Runtime hash mismatch: {}.", err);
+            anyhow!(err)
+        })
     }
 
     /// Send the data to the runtime_manager path on the Veracruz server
     /// and return the response.
-    async fn send(&mut self, data: &[u8]) -> Result<Vec<u8>, VeracruzClientError> {
+    pub(crate) fn send(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         self.tls_context.write_all(&data)?;
         let mut response = vec![];
-        self.tls_context.read_to_end(&mut response)?;
+        match self.tls_context.read_to_end(&mut response) {
+            Ok(_) => (),
+            // Suppress the following err
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+            Err(err) => return Err(anyhow!(err)),
+        };
         Ok(response)
-    }
-
-    // APIs for testing: expose internal functions
-    #[cfg(test)]
-    pub fn pub_read_all_bytes_in_file<P: AsRef<Path>>(
-        filename: P,
-    ) -> Result<Vec<u8>, VeracruzClientError> {
-        VeracruzClient::read_all_bytes_in_file(filename)
-    }
-
-    #[cfg(test)]
-    pub fn pub_read_cert<P: AsRef<Path>>(
-        filename: P,
-    ) -> Result<List<mbedtls::x509::Certificate>, VeracruzClientError> {
-        VeracruzClient::read_cert(filename)
-    }
-
-    #[cfg(test)]
-    pub fn pub_read_private_key<P: AsRef<Path>>(
-        filename: P,
-    ) -> Result<mbedtls::pk::Pk, VeracruzClientError> {
-        VeracruzClient::read_private_key(filename)
-    }
-
-    #[cfg(test)]
-    pub async fn pub_send(&mut self, data: &Vec<u8>) -> Result<Vec<u8>, VeracruzClientError> {
-        self.send(data).await
-    }
-}
-
-#[allow(dead_code)]
-fn print_hex(data: &[u8]) -> String {
-    let mut ret_val = String::new();
-    for this_byte in data {
-        ret_val.push_str(format!("{:02x}", this_byte).as_str());
-    }
-    ret_val
-}
-
-#[allow(dead_code)]
-fn decode_tls_message(data: &[u8]) {
-    match data[0] {
-        0x16 => {
-            print!("Handshake: ");
-            match data[5] {
-                0x01 => println!("Client hello"),
-                0x02 => println!("Server hello"),
-                0x0b => println!("Certificate"),
-                0x0c => println!("ServerKeyExchange"),
-                0x0d => println!("CertificateRequest"),
-                0x0e => println!("ServerHelloDone"),
-                0x10 => println!("ClientKeyExchange"),
-                0x0f => println!("CertificateVerify"),
-                0x14 => println!("Finished"),
-                _ => println!("Unknown"),
-            }
-        }
-        0x14 => {
-            println!("ChangeCipherSpec");
-        }
-        0x15 => {
-            println!("Alert");
-        }
-        0x17 => {
-            println!("ApplicationData");
-        }
-        _ => println!("Unknown"),
     }
 }
